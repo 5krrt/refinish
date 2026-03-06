@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+target/
+
+# Environment
+.env
+.env.*
+
+# Platform installers
+*.dmg
+*.exe
+*.msi
+*.AppImage
+*.deb
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.local
+
+# Logs
+*.log
+
+# Tauri generated
+src-tauri/gen/schemas
