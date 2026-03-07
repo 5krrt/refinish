@@ -6,6 +6,9 @@ use std::panic::catch_unwind;
 use std::path::PathBuf;
 use tauri::Emitter;
 
+#[cfg(target_os = "macos")]
+use trash::macos::{DeleteMethod, TrashContextExtMacos};
+
 // Progress payload sent to the frontend over Tauri events so each file's
 // progress bar can update independently as it finishes.
 #[derive(Clone, Serialize)]
@@ -174,7 +177,14 @@ fn compress_single(path: &str, output_format: &str, quality: u8) -> CompressionR
         };
     }
 
-    if let Err(e) = trash::delete(&original_path) {
+    let trash_result = {
+        let mut ctx = trash::TrashContext::new();
+        #[cfg(target_os = "macos")]
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(&original_path)
+    };
+
+    if let Err(e) = trash_result {
         let _ = fs::remove_file(&tmp_path);
         return CompressionResult {
             path: path.to_string(),
@@ -217,7 +227,7 @@ fn compress_single(path: &str, output_format: &str, quality: u8) -> CompressionR
 
 fn compress_jpeg(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
     let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
-    let rgb = img.to_rgb8();
+    let rgb = img.into_rgb8();
     let (width, height) = rgb.dimensions();
     let pixels = rgb.as_raw();
 
@@ -251,15 +261,16 @@ fn compress_png(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), St
 
 fn compress_webp(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
     let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
-    let encoder =
-        webp::Encoder::from_image(&img).map_err(|e| format!("WebP encoder error: {}", e))?;
+    let rgba = img.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    let encoder = webp::Encoder::from_rgba(rgba.as_raw(), width, height);
     let memory = encoder.encode(quality as f32);
     fs::write(output, &*memory).map_err(|e| format!("Cannot write compressed file: {}", e))
 }
 
 fn compress_avif(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
     let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
-    let rgba = img.to_rgba8();
+    let rgba = img.into_rgba8();
     let (width, height) = rgba.dimensions();
     let file =
         fs::File::create(output).map_err(|e| format!("Cannot create output file: {}", e))?;
