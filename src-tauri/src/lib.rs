@@ -37,13 +37,14 @@ async fn compress_images(
     app: tauri::AppHandle,
     file_paths: Vec<String>,
     output_format: String,
+    quality: u8,
 ) -> Result<Vec<CompressionResult>, String> {
     tokio::task::spawn_blocking(move || -> Vec<CompressionResult> {
         let mut indexed: Vec<(usize, CompressionResult)> = file_paths
             .par_iter()
             .enumerate()
             .map(|(i, p)| {
-                let result = compress_single(p, &output_format);
+                let result = compress_single(p, &output_format, quality);
                 let _ = app.emit(
                     "compression-progress",
                     FileProgress {
@@ -65,7 +66,7 @@ async fn compress_images(
 // Pipeline for a single file: decode → re-encode to a temp file → compare sizes → swap.
 // If the result isn't smaller we bail, so we never make things worse. The original gets
 // moved to the system trash (not permanently deleted) so users can recover if needed.
-fn compress_single(path: &str, output_format: &str) -> CompressionResult {
+fn compress_single(path: &str, output_format: &str, quality: u8) -> CompressionResult {
     let original_path = PathBuf::from(path);
     let name = original_path
         .file_name()
@@ -123,10 +124,10 @@ fn compress_single(path: &str, output_format: &str) -> CompressionResult {
         .join(format!(".{}.tmp", name));
 
     let compress_result = match effective_format {
-        "jpg" | "jpeg" => compress_jpeg(&original_path, &tmp_path),
-        "png" => compress_png(&original_path, &tmp_path),
-        "webp" => compress_webp(&original_path, &tmp_path),
-        "avif" => compress_avif(&original_path, &tmp_path),
+        "jpg" | "jpeg" => compress_jpeg(&original_path, &tmp_path, quality),
+        "png" => compress_png(&original_path, &tmp_path, quality),
+        "webp" => compress_webp(&original_path, &tmp_path, quality),
+        "avif" => compress_avif(&original_path, &tmp_path, quality),
         _ => Err(format!("Unsupported format: .{}", ext)),
     };
 
@@ -211,10 +212,10 @@ fn compress_single(path: &str, output_format: &str) -> CompressionResult {
     }
 }
 
-// Quality 80 for lossy formats — visually identical in most cases,
-// but typically shaves 40-70% off the file.
+// Quality is user-configurable (50-100). For lossy formats it maps directly
+// to encoder quality; for PNG it controls the oxipng optimization preset.
 
-fn compress_jpeg(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
+fn compress_jpeg(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
     let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
     let rgb = img.to_rgb8();
     let (width, height) = rgb.dimensions();
@@ -225,7 +226,7 @@ fn compress_jpeg(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
     let jpeg_bytes = catch_unwind(|| {
         let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
         comp.set_size(width as usize, height as usize);
-        comp.set_quality(80.0);
+        comp.set_quality(quality as f32);
         comp.set_mem_dest();
         comp.start_compress();
         comp.write_scanlines(pixels);
@@ -237,32 +238,33 @@ fn compress_jpeg(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
     fs::write(output, jpeg_bytes).map_err(|e| format!("Cannot write compressed file: {}", e))
 }
 
-fn compress_png(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
+fn compress_png(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
     let in_file = oxipng::InFile::Path(input.clone());
     let out_file = oxipng::OutFile::from_path(output.clone());
-    // Preset 1 is a solid middle ground — much better than libpng defaults
-    // without burning 30 seconds on a large file like the higher presets do
-    oxipng::optimize(&in_file, &out_file, &oxipng::Options::from_preset(1))
+    // Map quality to oxipng preset: higher quality = less aggressive (preset 1),
+    // lower quality = more aggressive compression (preset 4)
+    let preset = if quality >= 90 { 1 } else if quality >= 70 { 2 } else if quality >= 50 { 3 } else { 4 };
+    oxipng::optimize(&in_file, &out_file, &oxipng::Options::from_preset(preset))
         .map(|_| ())
         .map_err(|e| format!("OxiPNG optimization failed: {}", e))
 }
 
-fn compress_webp(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
+fn compress_webp(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
     let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
     let encoder =
         webp::Encoder::from_image(&img).map_err(|e| format!("WebP encoder error: {}", e))?;
-    let memory = encoder.encode(80.0);
+    let memory = encoder.encode(quality as f32);
     fs::write(output, &*memory).map_err(|e| format!("Cannot write compressed file: {}", e))
 }
 
-fn compress_avif(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
+fn compress_avif(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
     let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
     let file =
         fs::File::create(output).map_err(|e| format!("Cannot create output file: {}", e))?;
     let writer = std::io::BufWriter::new(file);
-    image::codecs::avif::AvifEncoder::new_with_speed_quality(writer, 10, 80)
+    image::codecs::avif::AvifEncoder::new_with_speed_quality(writer, 10, quality)
         .write_image(
             rgba.as_raw(),
             width,

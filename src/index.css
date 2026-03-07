@@ -65,6 +65,17 @@
   animation-delay: 0.36s;
 }
 
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+
 /* Dot grid backgrounds — inline SVG data URIs to skip extra network requests.
    Masked with a left-to-right gradient so dots fade in from the left edge,
    giving depth to the idle state. The "active" layer swaps to verdigris dots
@@ -91,25 +102,10 @@
   opacity: 0.7;
 }
 
-/* After compression finishes, hold the overlay visible for a beat
-   so the settle sweep can play, then fade the whole thing out */
-@keyframes settleAndFade {
-  0%, 85% { opacity: 1; }
-  100% { opacity: 0; }
-}
-
-.compress-settle {
-  animation: settleAndFade 1.4s forwards;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .ghost-in {
     animation: none;
     opacity: 1;
-  }
-  .compress-settle {
-    animation: none;
-    opacity: 0;
   }
   .dot-grid-base,
   .dot-grid-active-layer {

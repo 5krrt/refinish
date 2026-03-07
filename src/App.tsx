@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { flushSync } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -40,96 +41,155 @@ interface FileProgress {
   };
 }
 
-// Fakes a progress bar that eases toward ~95% using an exponential curve,
-// then snaps to 100% once the backend signals completion. This way the user
-// sees immediate feedback instead of a frozen bar while waiting on the real work.
-function useSimulatedProgress(isDone: boolean): number {
-  const [progress, setProgress] = useState(0);
-  const startRef = useRef<number | null>(null);
-  const rafRef = useRef<number>(0);
+function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const stored = localStorage.getItem(key);
+      return stored !== null ? JSON.parse(stored) : defaultValue;
+    } catch {
+      return defaultValue;
+    }
+  });
 
   useEffect(() => {
-    if (isDone) {
-      setProgress(1);
-      cancelAnimationFrame(rafRef.current);
-      return;
-    }
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
 
-    startRef.current = performance.now();
-
-    function tick() {
-      const elapsed = performance.now() - startRef.current!;
-      const t = elapsed / 5000;
-      // 1 - e^(-3t) gives a nice fast-start-slow-finish feel, capped at 95%
-      setProgress(Math.min(0.95, 1 - Math.exp(-3 * t)));
-      rafRef.current = requestAnimationFrame(tick);
-    }
-
-    rafRef.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [isDone]);
-
-  return progress;
+  return [value, setValue];
 }
 
-// Each file gets a horizontal band filled with a dot grid. Columns light up
-// in verdigris as progress fills left-to-right, then sweep back to neutral
-// when compression finishes (the "settle" effect).
+// Pre-render a single rounded dot onto a tiny canvas so we can stamp it
+// with drawImage instead of running path ops per dot.
+function makeDotStamp(color: string): HTMLCanvasElement {
+  const dpr = devicePixelRatio;
+  const c = document.createElement("canvas");
+  c.width = 4 * dpr;
+  c.height = 4 * dpr;
+  const dc = c.getContext("2d")!;
+  dc.scale(dpr, dpr);
+  dc.fillStyle = color;
+  dc.beginPath();
+  dc.roundRect(0, 0, 4, 4, 1);
+  dc.fill();
+  return c;
+}
+
+// Each file gets a horizontal band filled with a dot grid drawn on canvas.
+// Columns light up in verdigris as progress fills left-to-right, then sweep
+// back to neutral when compression finishes (the "settle" effect).
+// All animation runs in a single rAF loop with no React re-renders.
 function ProgressBand({
   file,
+  index,
   totalFiles,
   settling,
 }: {
   file: CompressingFile;
+  index: number;
   totalFiles: number;
   settling: boolean;
 }) {
-  const progress = useSimulatedProgress(file.done);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [grid, setGrid] = useState({ cols: 0, rows: 0 });
-  const [settleProgress, setSettleProgress] = useState<number | null>(null);
+  const stateRef = useRef({ done: file.done, settling });
+  stateRef.current.done = file.done;
+  stateRef.current.settling = settling;
 
-  // Figure out how many dots fit in the container — recalculates on resize
   useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    if (!container || !canvas) return;
 
-    const observer = new ResizeObserver((entries) => {
-      const { width, height } = entries[0].contentRect;
-      const cell = 7; // 4px block + 3px gap
-      setGrid({
-        cols: Math.floor(width / cell),
-        rows: Math.floor(height / cell),
-      });
-    });
-
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-
-  // Settle animation: sweeps left-to-right fading verdigris blocks back to neutral
-  useEffect(() => {
-    if (!settling) {
-      setSettleProgress(null);
-      return;
-    }
-    const start = performance.now();
+    const ctx = canvas.getContext("2d")!;
+    const dotSize = 4;
+    const gap = 3;
+    const cell = dotSize + gap; // 7
+    let cols = 0, rows = 0;
+    const progressStart = performance.now();
+    const staggerDelay = index * 150;
+    const settleDelay = index * 100;
+    let settleStart: number | null = null;
+    let progress = 0;
+    let settleProgress = 0;
     let raf: number;
-    function tick() {
-      const elapsed = performance.now() - start;
-      const t = Math.min(1, elapsed / 1200);
-      setSettleProgress(1 - Math.pow(1 - t, 3));
-      if (t < 1) raf = requestAnimationFrame(tick);
-    }
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [settling]);
 
-  const totalBlocks = grid.cols * grid.rows;
-  const filledCols = Math.round(progress * grid.cols);
-  const settledCols = settleProgress !== null
-    ? Math.round(settleProgress * grid.cols)
-    : 0;
+    const verdigrisDot = makeDotStamp("#43B3AE");
+    const neutralDot = makeDotStamp("#242424");
+
+    const resize = () => {
+      const dpr = devicePixelRatio;
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      canvas.width = w * dpr;
+      canvas.height = h * dpr;
+      cols = Math.floor(w / cell);
+      rows = Math.floor(h / cell);
+    };
+
+    const observer = new ResizeObserver(resize);
+    observer.observe(container);
+    resize();
+
+    function draw() {
+      const now = performance.now();
+      const { done, settling } = stateRef.current;
+      const dpr = devicePixelRatio;
+      const w = canvas.width / dpr;
+      const h = canvas.height / dpr;
+
+      if (done) progress = 1;
+      else {
+        const elapsed = Math.max(0, now - progressStart - staggerDelay);
+        progress = Math.min(0.95, 1 - Math.exp(-3 * elapsed / 5000));
+      }
+
+      if (settling) {
+        if (settleStart === null) settleStart = now;
+        settleProgress = Math.min(1, Math.max(0, (now - settleStart - settleDelay) / 500));
+      } else {
+        settleStart = null;
+        settleProgress = 0;
+      }
+
+      if (cols === 0 || rows === 0) {
+        raf = requestAnimationFrame(draw);
+        return;
+      }
+
+      const filledCols = Math.round(progress * cols);
+      const settledCols = settling ? Math.round(settleProgress * cols) : 0;
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      // Center grid — match CSS grid sizing (no trailing gap)
+      const gridW = cols * dotSize + (cols - 1) * gap;
+      const gridH = rows * dotSize + (rows - 1) * gap;
+      const ox = (w - gridW) / 2;
+      const oy = (h - gridH) / 2;
+
+      for (let col = 0; col < cols; col++) {
+        const x = ox + col * cell;
+        const filled = col < filledCols;
+        const settled = settling && col < settledCols;
+        const dot = filled && !settled ? verdigrisDot : neutralDot;
+        ctx.globalAlpha = filled && !settled ? col / (cols - 1 || 1) : 1;
+
+        for (let row = 0; row < rows; row++) {
+          ctx.drawImage(dot, x, oy + row * cell, dotSize, dotSize);
+        }
+      }
+
+      ctx.globalAlpha = 1;
+      raf = requestAnimationFrame(draw);
+    }
+
+    raf = requestAnimationFrame(draw);
+    return () => {
+      cancelAnimationFrame(raf);
+      observer.disconnect();
+    };
+  }, [index]);
 
   return (
     <div
@@ -137,49 +197,116 @@ function ProgressBand({
       className="relative overflow-hidden"
       style={{ height: `${100 / totalFiles}%` }}
     >
+      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
+      <div
+        className="absolute bottom-3 left-4 text-sm text-gf-text font-condensed font-medium pointer-events-none"
+        style={{
+          textShadow: '0 1px 3px rgba(0,0,0,0.5)',
+          opacity: settling ? 0 : undefined,
+          transition: settling ? 'opacity 0.4s cubic-bezier(0.25, 1, 0.5, 1)' : undefined,
+        }}
+      >
+        {file.name}
+      </div>
+    </div>
+  );
+}
+
+function PixelSlider({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [cols, setCols] = useState(0);
+  const rows = 5;
+  const draggingRef = useRef(false);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const { width } = entries[0].contentRect;
+      const cell = 7; // 4px block + 3px gap
+      flushSync(() => setCols(Math.floor(width / cell)));
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const valueFromX = useCallback(
+    (clientX: number) => {
+      const el = containerRef.current;
+      if (!el || cols === 0) return value;
+      const rect = el.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      return Math.round(50 + ratio * 50);
+    },
+    [cols, value]
+  );
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      draggingRef.current = true;
+      onChange(valueFromX(e.clientX));
+
+      const onMove = (ev: MouseEvent) => {
+        if (draggingRef.current) onChange(valueFromX(ev.clientX));
+      };
+      const onUp = () => {
+        draggingRef.current = false;
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [onChange, valueFromX]
+  );
+
+  const filledCols = cols > 0 ? Math.round(((value - 50) / 50) * cols) : 0;
+  const totalBlocks = cols * rows;
+
+  return (
+    <div
+      ref={containerRef}
+      className="cursor-pointer select-none"
+      style={{ height: 32 }}
+      onMouseDown={handleMouseDown}
+    >
       {totalBlocks > 0 && (
         <div
           className="grid w-full h-full"
           style={{
-            gridTemplateColumns: `repeat(${grid.cols}, 4px)`,
-            gridTemplateRows: `repeat(${grid.rows}, 4px)`,
+            gridTemplateColumns: `repeat(${cols}, 4px)`,
+            gridTemplateRows: `repeat(${rows}, 4px)`,
             gap: "3px",
-            justifyContent: "center",
+            justifyContent: "start",
             alignContent: "center",
           }}
         >
           {Array.from({ length: totalBlocks }, (_, i) => {
-            const col = i % grid.cols;
+            const col = i % cols;
             const filled = col < filledCols;
-            const settled = settling && col < settledCols;
-            const t = col / (grid.cols - 1 || 1);
-            return (
+            return filled ? (
               <div
                 key={i}
                 style={{
                   width: 4,
                   height: 4,
                   borderRadius: 1,
-                  backgroundColor: filled
-                    ? "var(--color-gf-verdigris)"
-                    : "var(--color-gf-surface-2)",
-                  opacity: settled ? 0 : filled ? t : 1,
+                  backgroundColor: "var(--color-gf-verdigris)",
                 }}
               />
+            ) : (
+              <div key={i} />
             );
           })}
         </div>
       )}
-      <div
-        className="absolute bottom-3 left-4 text-sm text-gf-text font-condensed font-medium pointer-events-none"
-        style={{
-          textShadow: '0 1px 3px rgba(0,0,0,0.5)',
-          opacity: settling ? 0 : undefined,
-          transition: settling ? 'opacity 0.6s cubic-bezier(0.25, 1, 0.5, 1)' : undefined,
-        }}
-      >
-        {file.name}
-      </div>
     </div>
   );
 }
@@ -191,6 +318,26 @@ function App() {
   );
   const [isDragOver, setIsDragOver] = useState(false);
   const compressingRef = useRef(false);
+  const [quality, setQuality] = usePersistedState("refinish:quality", 80);
+  const [mode, setMode] = usePersistedState<"compress" | "convert">("refinish:mode", "compress");
+  const [convertFormat, setConvertFormat] = usePersistedState("refinish:convertFormat", "webp");
+  const [showFormats, setShowFormats] = useState(mode === "convert");
+  const [formatsExiting, setFormatsExiting] = useState(false);
+  const [settleComplete, setSettleComplete] = useState(false);
+
+  useEffect(() => {
+    if (mode === "convert") {
+      setFormatsExiting(false);
+      setShowFormats(true);
+    } else if (showFormats) {
+      setFormatsExiting(true);
+      const timer = setTimeout(() => {
+        setShowFormats(false);
+        setFormatsExiting(false);
+      }, 250 + 3 * 60); // last button delay + animation duration
+      return () => clearTimeout(timer);
+    }
+  }, [mode]);
 
   // Guard with a ref instead of state to avoid the stale-closure problem —
   // this way we can always check the latest value inside event handlers.
@@ -216,11 +363,12 @@ function App() {
 
     invoke("compress_images", {
       filePaths: filtered,
-      outputFormat: "original",
+      outputFormat: mode === "convert" ? convertFormat : "original",
+      quality,
     }).finally(() => {
       compressingRef.current = false;
     });
-  }, []);
+  }, [mode, convertFormat, quality]);
 
   // Tauri drag-and-drop events (native, not HTML5 drag events)
   useEffect(() => {
@@ -256,7 +404,7 @@ function App() {
     return () => cancel?.();
   }, []);
 
-  // Once every file has reported back, hold for a second then flip to "done"
+  // Once every file has reported back, flip to "done" immediately
   // which triggers the settle animation before returning to idle
   useEffect(() => {
     if (
@@ -266,12 +414,19 @@ function App() {
     )
       return;
 
-    const timer = setTimeout(() => {
-      setAppState("done");
-    }, 1000);
-
-    return () => clearTimeout(timer);
+    setAppState("done");
   }, [appState, compressingFiles]);
+
+  // After all bands finish settling, fade out the overlay then reset to idle
+  useEffect(() => {
+    if (appState !== "done") {
+      setSettleComplete(false);
+      return;
+    }
+    const totalSettleTime = (compressingFiles.length - 1) * 100 + 500;
+    const timer = setTimeout(() => setSettleComplete(true), totalSettleTime);
+    return () => clearTimeout(timer);
+  }, [appState, compressingFiles.length]);
 
   return (
     <div
@@ -297,7 +452,7 @@ function App() {
               xmlns="http://www.w3.org/2000/svg"
               viewBox="0 0 24 24"
               aria-hidden="true"
-              className={`w-12 h-12 mb-6 transition-all duration-500 ${isDragOver ? "text-gf-success scale-110" : "text-gf-text"}`}
+              className={`w-12 h-12 mb-6 -ml-1.5 transition-all duration-500 ${isDragOver ? "text-gf-success scale-110" : "text-gf-text"}`}
             >
               <path
                 fill="currentColor"
@@ -317,36 +472,96 @@ function App() {
                 />
               </g>
             </svg>
-            <p
-              className={`text-lg font-display tracking-tight transition-all duration-500 ${isDragOver ? "text-gf-success" : "text-gf-text"}`}
-            >
-              {isDragOver ? "Drop to compress" : "Make images lighter"}
-            </p>
-            <p
-              className={`text-xs font-condensed mt-2 tracking-wide transition-all duration-500 ${isDragOver ? "text-gf-success" : "text-gf-text"}`}
-            >
-              {isDragOver
-                ? "JPEG, PNG, WebP, AVIF"
-                : "Drop images \u00b7 JPEG, PNG, WebP, AVIF"}
-            </p>
+            <div>
+              <p
+                className={`text-lg font-display tracking-tight transition-all duration-500 ${isDragOver ? "text-gf-success" : "text-gf-text"}`}
+              >
+                {isDragOver
+                  ? mode === "convert" ? "Drop to convert" : "Drop to compress"
+                  : mode === "convert" ? "Convert your images" : "Make images lighter"}
+              </p>
+              <p
+                className={`text-xs font-condensed mt-2 tracking-wide transition-all duration-500 ${isDragOver ? "text-gf-success" : "text-gf-text"}`}
+              >
+                {isDragOver
+                  ? "JPEG, PNG, WebP, AVIF"
+                  : "Drop images \u00b7 JPEG, PNG, WebP, AVIF"}
+              </p>
+            </div>
           </div>
         </main>
       )}
 
+      {(appState === "idle" || appState === "done") && (
+        <div
+          className={`absolute bottom-0 left-0 right-0 z-10 px-16 pb-10 ghost-in ghost-delay-3 transition-opacity duration-500 ${isDragOver ? "opacity-0" : ""}`}
+        >
+          <div className="flex items-center gap-3 mb-4">
+            <button
+              className={`font-condensed text-xs tracking-wide transition-colors duration-300 ${mode === "compress" ? "text-gf-verdigris" : "text-gf-text-secondary"}`}
+              onClick={() => setMode("compress")}
+            >
+              COMPRESS
+            </button>
+            <button
+              className={`font-condensed text-xs tracking-wide transition-colors duration-300 ${mode === "convert" ? "text-gf-verdigris" : "text-gf-text-secondary"}`}
+              onClick={() => setMode("convert")}
+            >
+              CONVERT
+            </button>
+            {showFormats && (
+              <div className="flex items-center gap-2 ml-2">
+                {(["jpg", "png", "webp", "avif"] as const).map((fmt, i) => (
+                  <button
+                    key={fmt}
+                    className={`font-condensed text-xs tracking-wide transition-colors duration-300 ${convertFormat === fmt ? "text-gf-verdigris" : "text-gf-text-secondary"}`}
+                    style={{
+                      animation: formatsExiting
+                        ? `fadeOut 250ms ${(3 - i) * 60}ms cubic-bezier(0.16, 1, 0.3, 1) forwards`
+                        : `fadeIn 250ms ${i * 60}ms cubic-bezier(0.16, 1, 0.3, 1) forwards`,
+                      opacity: formatsExiting ? 1 : 0,
+                    }}
+                    onClick={() => setConvertFormat(fmt)}
+                  >
+                    {fmt.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-4">
+            <div className="flex-1">
+              <PixelSlider value={quality} onChange={setQuality} />
+            </div>
+            <div className="flex flex-col items-end">
+              <span className="font-condensed text-xs text-gf-text-secondary">QUALITY</span>
+              <span className="font-condensed text-xs text-gf-text-secondary tabular-nums">
+                {quality}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {(appState === "compressing" || appState === "done") && (
         <div
-          className={`absolute inset-0 z-[5] flex flex-col ${appState === "done" ? "compress-settle" : ""}`}
-          onAnimationEnd={() => {
-            if (appState === "done") {
+          className="absolute inset-0 z-[5] flex flex-col"
+          style={{
+            opacity: settleComplete ? 0 : 1,
+            transition: settleComplete ? "opacity 0.3s cubic-bezier(0.25, 1, 0.5, 1)" : undefined,
+          }}
+          onTransitionEnd={(e) => {
+            if (e.propertyName === "opacity" && e.currentTarget === e.target && settleComplete) {
               setAppState("idle");
               setCompressingFiles([]);
             }
           }}
         >
-          {compressingFiles.map((file) => (
+          {compressingFiles.map((file, i) => (
             <ProgressBand
               key={file.path}
               file={file}
+              index={i}
               totalFiles={compressingFiles.length}
               settling={appState === "done"}
             />
