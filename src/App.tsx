@@ -2,30 +2,11 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
-interface ImageFile {
-  path: string;
-  name: string;
-}
-
-interface CompressionResult {
-  path: string;
-  name: string;
-  originalSize: number;
-  compressedSize: number;
-  savingsPercent: number;
-  success: boolean;
-  error: string | null;
-}
-
+// Formats we can actually compress on the backend
 const validExts = ["jpg", "jpeg", "png", "webp", "avif"];
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
-}
-
+// Only macOS and Windows support window translucency in Tauri — on Linux
+// we fall back to a solid background so it doesn't look broken.
 const supportsTranslucency = (() => {
   const nav = navigator as Navigator & { userAgentData?: { platform: string } };
   if (nav.userAgentData?.platform) {
@@ -35,54 +16,213 @@ const supportsTranslucency = (() => {
   return /Mac|Win/.test(navigator.platform);
 })();
 
-function Spinner({ size = "sm" }: { size?: "sm" | "md" }) {
+// State machine: idle → compressing → done → idle
+// "done" is a brief transitional state that plays the settle animation
+// before resetting back to the drop zone.
+type AppState = "idle" | "compressing" | "done";
+
+interface CompressingFile {
+  path: string;
+  name: string;
+  done: boolean;
+}
+
+interface FileProgress {
+  index: number;
+  result: {
+    path: string;
+    name: string;
+    originalSize: number;
+    compressedSize: number;
+    savingsPercent: number;
+    success: boolean;
+    error: string | null;
+  };
+}
+
+// Fakes a progress bar that eases toward ~95% using an exponential curve,
+// then snaps to 100% once the backend signals completion. This way the user
+// sees immediate feedback instead of a frozen bar while waiting on the real work.
+function useSimulatedProgress(isDone: boolean): number {
+  const [progress, setProgress] = useState(0);
+  const startRef = useRef<number | null>(null);
+  const rafRef = useRef<number>(0);
+
+  useEffect(() => {
+    if (isDone) {
+      setProgress(1);
+      cancelAnimationFrame(rafRef.current);
+      return;
+    }
+
+    startRef.current = performance.now();
+
+    function tick() {
+      const elapsed = performance.now() - startRef.current!;
+      const t = elapsed / 5000;
+      // 1 - e^(-3t) gives a nice fast-start-slow-finish feel, capped at 95%
+      setProgress(Math.min(0.95, 1 - Math.exp(-3 * t)));
+      rafRef.current = requestAnimationFrame(tick);
+    }
+
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [isDone]);
+
+  return progress;
+}
+
+// Each file gets a horizontal band filled with a dot grid. Columns light up
+// in verdigris as progress fills left-to-right, then sweep back to neutral
+// when compression finishes (the "settle" effect).
+function ProgressBand({
+  file,
+  totalFiles,
+  settling,
+}: {
+  file: CompressingFile;
+  totalFiles: number;
+  settling: boolean;
+}) {
+  const progress = useSimulatedProgress(file.done);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [grid, setGrid] = useState({ cols: 0, rows: 0 });
+  const [settleProgress, setSettleProgress] = useState<number | null>(null);
+
+  // Figure out how many dots fit in the container — recalculates on resize
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const observer = new ResizeObserver((entries) => {
+      const { width, height } = entries[0].contentRect;
+      const cell = 7; // 4px block + 3px gap
+      setGrid({
+        cols: Math.floor(width / cell),
+        rows: Math.floor(height / cell),
+      });
+    });
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  // Settle animation: sweeps left-to-right fading verdigris blocks back to neutral
+  useEffect(() => {
+    if (!settling) {
+      setSettleProgress(null);
+      return;
+    }
+    const start = performance.now();
+    let raf: number;
+    function tick() {
+      const elapsed = performance.now() - start;
+      const t = Math.min(1, elapsed / 1200);
+      setSettleProgress(1 - Math.pow(1 - t, 3));
+      if (t < 1) raf = requestAnimationFrame(tick);
+    }
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [settling]);
+
+  const totalBlocks = grid.cols * grid.rows;
+  const filledCols = Math.round(progress * grid.cols);
+  const settledCols = settleProgress !== null
+    ? Math.round(settleProgress * grid.cols)
+    : 0;
+
   return (
-    <svg
-      className={`${size === "sm" ? "w-3.5 h-3.5" : "w-4 h-4"} animate-spin`}
-      viewBox="0 0 24 24"
-      fill="none"
-      aria-hidden="true"
+    <div
+      ref={containerRef}
+      className="relative overflow-hidden"
+      style={{ height: `${100 / totalFiles}%` }}
     >
-      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" className="opacity-25" />
-      <path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" className="opacity-75" />
-    </svg>
+      {totalBlocks > 0 && (
+        <div
+          className="grid w-full h-full"
+          style={{
+            gridTemplateColumns: `repeat(${grid.cols}, 4px)`,
+            gridTemplateRows: `repeat(${grid.rows}, 4px)`,
+            gap: "3px",
+            justifyContent: "center",
+            alignContent: "center",
+          }}
+        >
+          {Array.from({ length: totalBlocks }, (_, i) => {
+            const col = i % grid.cols;
+            const filled = col < filledCols;
+            const settled = settling && col < settledCols;
+            const t = col / (grid.cols - 1 || 1);
+            return (
+              <div
+                key={i}
+                style={{
+                  width: 4,
+                  height: 4,
+                  borderRadius: 1,
+                  backgroundColor: filled
+                    ? "var(--color-gf-verdigris)"
+                    : "var(--color-gf-surface-2)",
+                  opacity: settled ? 0 : filled ? t : 1,
+                }}
+              />
+            );
+          })}
+        </div>
+      )}
+      <div
+        className="absolute bottom-3 left-4 text-sm text-gf-text font-condensed font-medium pointer-events-none"
+        style={{
+          textShadow: '0 1px 3px rgba(0,0,0,0.5)',
+          opacity: settling ? 0 : undefined,
+          transition: settling ? 'opacity 0.6s cubic-bezier(0.25, 1, 0.5, 1)' : undefined,
+        }}
+      >
+        {file.name}
+      </div>
+    </div>
   );
 }
 
-const focusRing = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gf-accent focus-visible:ring-offset-2 focus-visible:ring-offset-gf-bg";
-
 function App() {
-  const [files, setFiles] = useState<ImageFile[]>([]);
-  const [results, setResults] = useState<CompressionResult[]>([]);
-  const [compressingIndex, setCompressingIndex] = useState<number | null>(null);
-  const compressingRef = useRef(false);
-  const [isDragOver, setIsDragOver] = useState(false);
-  const [outputFormat, setOutputFormat] = useState<string>("original");
-
-  const addFiles = useCallback(
-    (paths: string[]) => {
-      if (compressingRef.current) return;
-      const newFiles: ImageFile[] = paths
-        .filter((p) => {
-          const ext = p.split(".").pop()?.toLowerCase() ?? "";
-          return validExts.includes(ext);
-        })
-        .map((p) => ({
-          path: p,
-          name: p.split("/").pop()?.split("\\").pop() ?? p,
-        }));
-
-      if (newFiles.length > 0) {
-        setFiles((prev) => {
-          const existing = new Set(prev.map((f) => f.path));
-          return [...prev, ...newFiles.filter((f) => !existing.has(f.path))];
-        });
-        setResults([]);
-      }
-    },
+  const [appState, setAppState] = useState<AppState>("idle");
+  const [compressingFiles, setCompressingFiles] = useState<CompressingFile[]>(
     []
   );
+  const [isDragOver, setIsDragOver] = useState(false);
+  const compressingRef = useRef(false);
 
+  // Guard with a ref instead of state to avoid the stale-closure problem —
+  // this way we can always check the latest value inside event handlers.
+  const handleDrop = useCallback((paths: string[]) => {
+    if (compressingRef.current) return;
+
+    const filtered = paths.filter((p) => {
+      const ext = p.split(".").pop()?.toLowerCase() ?? "";
+      return validExts.includes(ext);
+    });
+
+    if (filtered.length === 0) return;
+
+    const files: CompressingFile[] = filtered.map((p) => ({
+      path: p,
+      name: p.split("/").pop()?.split("\\").pop() ?? p,
+      done: false,
+    }));
+
+    compressingRef.current = true;
+    setCompressingFiles(files);
+    setAppState("compressing");
+
+    invoke("compress_images", {
+      filePaths: filtered,
+      outputFormat: "original",
+    }).finally(() => {
+      compressingRef.current = false;
+    });
+  }, []);
+
+  // Tauri drag-and-drop events (native, not HTML5 drag events)
   useEffect(() => {
     const unlisten: (() => void)[] = [];
 
@@ -94,307 +234,125 @@ function App() {
     );
     listen<{ paths: string[] }>("tauri://drag-drop", (event) => {
       setIsDragOver(false);
-      addFiles(event.payload.paths);
+      handleDrop(event.payload.paths);
     }).then((u) => unlisten.push(u));
 
     return () => unlisten.forEach((u) => u());
-  }, [addFiles]);
+  }, [handleDrop]);
 
-  async function handleCompress() {
-    compressingRef.current = true;
-    setResults([]);
-    setCompressingIndex(0);
-    try {
-      const res = await invoke<CompressionResult[]>("compress_images", {
-        filePaths: files.map((f) => f.path),
-        outputFormat: outputFormat,
-      });
-      setResults(res);
-    } catch {
-      setResults(
-        files.map((f) => ({
-          path: f.path,
-          name: f.name,
-          originalSize: 0,
-          compressedSize: 0,
-          savingsPercent: 0,
-          success: false,
-          error: "Compression failed",
-        }))
+  // Backend fires one of these per file as it finishes
+  useEffect(() => {
+    let cancel: (() => void) | null = null;
+
+    listen<FileProgress>("compression-progress", (event) => {
+      const { index } = event.payload;
+      setCompressingFiles((prev) =>
+        prev.map((f, i) => (i === index ? { ...f, done: true } : f))
       );
-    }
-    setCompressingIndex(null);
-    compressingRef.current = false;
-    setFiles([]);
-  }
+    }).then((u) => {
+      cancel = u;
+    });
 
-  function handleClear() {
-    setFiles([]);
-    setResults([]);
-    setOutputFormat("original");
-  }
+    return () => cancel?.();
+  }, []);
 
-  const hasFiles = files.length > 0;
-  const hasResults = results.length > 0;
+  // Once every file has reported back, hold for a second then flip to "done"
+  // which triggers the settle animation before returning to idle
+  useEffect(() => {
+    if (
+      appState !== "compressing" ||
+      compressingFiles.length === 0 ||
+      !compressingFiles.every((f) => f.done)
+    )
+      return;
 
-  const totalOriginal = results.reduce((s, r) => s + r.originalSize, 0);
-  const totalCompressed = results.reduce((s, r) => s + r.compressedSize, 0);
-  const totalSavings =
-    totalOriginal > 0
-      ? ((1 - totalCompressed / totalOriginal) * 100).toFixed(1)
-      : "0.0";
+    const timer = setTimeout(() => {
+      setAppState("done");
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [appState, compressingFiles]);
 
   return (
     <div
       className={`relative h-screen text-gf-text font-display ${supportsTranslucency ? "bg-gf-bg/30 backdrop-blur-xl" : "bg-gf-bg"}`}
     >
-      <header className="absolute top-0 right-0 flex items-center justify-end px-6 h-14 z-10">
-        {hasFiles && !hasResults && compressingIndex === null ? (
-          <div
-            role="radiogroup"
-            aria-label="Output format"
-            className="flex items-center gap-0.5 bg-gf-surface-2 rounded-lg p-0.5"
-          >
-            {["original", "webp", "avif"].map((fmt) => (
-              <button
-                key={fmt}
-                role="radio"
-                aria-checked={outputFormat === fmt}
-                onClick={() => setOutputFormat(fmt)}
-                className={`px-4 py-2 text-sm rounded-md transition-all duration-200 ${focusRing} ${
-                  outputFormat === fmt
-                    ? "bg-gf-surface-3 text-gf-text"
-                    : "text-gf-text-tertiary hover:text-gf-text-secondary"
-                }`}
-              >
-                {fmt === "original" ? "Original" : fmt.toUpperCase()}
-              </button>
-            ))}
-          </div>
-        ) : (outputFormat !== "original" && (hasFiles || hasResults)) ? (
-          <span className="text-xs font-medium text-gf-text-tertiary bg-gf-surface-2 px-3 py-1.5 rounded-lg">
-            {outputFormat.toUpperCase()}
-          </span>
-        ) : null}
-      </header>
-
-      {!hasFiles && !hasResults && (
+      {(appState === "idle" || appState === "done") && (
         <>
-          <div className={`dot-grid-base absolute inset-0 z-0 transition-opacity duration-500 ${isDragOver ? "opacity-0" : ""}`} aria-hidden="true" />
-          <div className={`dot-grid-active-layer absolute inset-0 z-0${isDragOver ? " active" : ""}`} aria-hidden="true" />
+          <div
+            className={`dot-grid-base absolute inset-0 z-0 transition-opacity duration-500 ${isDragOver ? "opacity-0" : ""}`}
+            aria-hidden="true"
+          />
+          <div
+            className={`dot-grid-active-layer absolute inset-0 z-0${isDragOver ? " active" : ""}`}
+            aria-hidden="true"
+          />
         </>
       )}
 
-      <main className="relative z-10 flex h-full items-center px-16 py-12">
-        {/* Empty / Drop zone */}
-        {!hasFiles && !hasResults && (
-          <div
-            className="ghost-in ghost-delay-1 flex flex-col items-start w-full max-w-lg"
-          >
+      {(appState === "idle" || appState === "done") && (
+        <main className="relative z-10 flex h-full items-center px-16 py-12">
+          <div className="ghost-in ghost-delay-1 flex flex-col items-start w-full max-w-lg">
             <svg
               xmlns="http://www.w3.org/2000/svg"
-              fill="none"
               viewBox="0 0 24 24"
-              strokeWidth={1}
-              stroke="currentColor"
               aria-hidden="true"
               className={`w-12 h-12 mb-6 transition-all duration-500 ${isDragOver ? "text-gf-success scale-110" : "text-gf-text"}`}
             >
               <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M9 9V4.5M9 9H4.5M9 9 3.75 3.75M9 15v4.5M9 15H4.5M9 15l-5.25 5.25M15 9h4.5M15 9V4.5M15 9l5.25-5.25M15 15h4.5M15 15v4.5m0-4.5 5.25 5.25"
+                fill="currentColor"
+                d="M3.75 3.75H20.25V9H9V20.25H3.75Z"
               />
+              <g
+                className="transition-transform duration-500"
+                style={{ transform: isDragOver ? "translate(-1px, -1px)" : "translate(0, 0)" }}
+              >
+                <path
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={1}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M15 15h4.5M15 15v4.5M15 15l5.25 5.25"
+                />
+              </g>
             </svg>
             <p
-              className={`text-lg font-medium tracking-tight transition-all duration-500 ${isDragOver ? "text-gf-success" : "text-gf-text"}`}
+              className={`text-lg font-display tracking-tight transition-all duration-500 ${isDragOver ? "text-gf-success" : "text-gf-text"}`}
             >
               {isDragOver ? "Drop to compress" : "Make images lighter"}
             </p>
-            <p className={`text-xs mt-2 tracking-wide transition-all duration-500 ${isDragOver ? "text-gf-success" : "text-gf-text"}`}>
-              {isDragOver ? "JPEG, PNG, WebP, AVIF" : "Drop images \u00b7 JPEG, PNG, WebP, AVIF"}
+            <p
+              className={`text-xs font-condensed mt-2 tracking-wide transition-all duration-500 ${isDragOver ? "text-gf-success" : "text-gf-text"}`}
+            >
+              {isDragOver
+                ? "JPEG, PNG, WebP, AVIF"
+                : "Drop images \u00b7 JPEG, PNG, WebP, AVIF"}
             </p>
           </div>
-        )}
+        </main>
+      )}
 
-        {/* File list (pre/during compression) */}
-        {hasFiles && (
-          <div className="w-full max-w-lg ghost-in ghost-delay-1">
-            <ul className="rounded-2xl border border-gf-border-subtle overflow-hidden">
-              {files.map((f, i) => {
-                const result = results[i];
-                const isActive = compressingIndex !== null;
-                return (
-                  <li
-                    key={f.path}
-                    className={`ghost-in flex items-center justify-between px-5 py-3.5 ${
-                      i > 0 ? "border-t border-gf-border-subtle" : ""
-                    }`}
-                    style={{ animationDelay: `${0.1 + i * 0.08}s` }}
-                  >
-                    <span className="text-sm truncate mr-6 text-gf-text-secondary">
-                      {f.name}
-                    </span>
-                    {result ? (
-                      result.success ? (
-                        <span className="flex items-center gap-4 shrink-0">
-                          <span className="font-mono text-xs text-gf-text-tertiary tabular-nums">
-                            {formatBytes(result.originalSize)} &rarr;{" "}
-                            {formatBytes(result.compressedSize)}
-                          </span>
-                          <span
-                            className={`font-mono text-sm font-semibold tabular-nums ${
-                              result.savingsPercent > 20
-                                ? "text-gf-success"
-                                : result.savingsPercent > 0
-                                  ? "text-gf-text-secondary"
-                                  : "text-gf-text-tertiary"
-                            }`}
-                          >
-                            {result.savingsPercent > 0
-                              ? `-${result.savingsPercent.toFixed(1)}%`
-                              : "0%"}
-                          </span>
-                        </span>
-                      ) : (
-                        <span className="text-xs text-gf-error shrink-0">
-                          {result.error ?? "Failed"}
-                        </span>
-                      )
-                    ) : isActive ? (
-                      <span
-                        role="status"
-                        aria-label="Compressing"
-                        className="flex items-center gap-2 text-xs text-gf-text-tertiary shrink-0"
-                      >
-                        <Spinner size="sm" />
-                        Compressing
-                      </span>
-                    ) : null}
-                  </li>
-                );
-              })}
-            </ul>
-
-            <div className="flex items-center gap-3 mt-6">
-              {compressingIndex !== null ? (
-                <span
-                  role="status"
-                  aria-label={`Compressing ${files.length} ${files.length === 1 ? "file" : "files"}`}
-                  className="px-5 py-2.5 text-sm text-gf-text-tertiary flex items-center gap-2.5"
-                >
-                  <Spinner size="md" />
-                  Compressing {files.length} {files.length === 1 ? "file" : "files"}
-                </span>
-              ) : (
-                <button
-                  onClick={handleCompress}
-                  className={`px-5 py-2.5 text-sm font-medium rounded-xl bg-gf-accent text-gf-accent-text hover:bg-gf-accent-hover active:bg-gf-accent transition-all duration-200 ${focusRing}`}
-                >
-                  {outputFormat !== "original"
-                    ? `Convert to ${outputFormat.toUpperCase()}`
-                    : "Compress"}
-                </button>
-              )}
-              <button
-                onClick={handleClear}
-                disabled={compressingIndex !== null}
-                className={`px-5 py-2.5 text-sm rounded-xl text-gf-text-tertiary hover:text-gf-text-secondary hover:bg-gf-surface-2 disabled:opacity-30 transition-all duration-300 ${focusRing}`}
-              >
-                Clear
-              </button>
-            </div>
-
-            {compressingIndex === null && (
-              <p className="text-xs text-gf-text-disabled mt-4">
-                Drop more to add
-              </p>
-            )}
-          </div>
-        )}
-
-        {/* Results */}
-        {!hasFiles && hasResults && (
-          <div
-            className="w-full max-w-lg ghost-in ghost-delay-1"
-            aria-live="polite"
-          >
-            <div className="mb-6 ghost-in ghost-delay-1">
-              <p className={`text-4xl font-bold tracking-tight tabular-nums font-mono ${
-                Number(totalSavings) > 20 ? "text-gf-success"
-                : Number(totalSavings) > 0 ? "text-gf-text-secondary"
-                : "text-gf-text-tertiary"
-              }`}>
-                {Number(totalSavings) > 0 ? `-${totalSavings}%` : "0%"}
-              </p>
-              <p className="text-sm text-gf-text-tertiary mt-1">
-                Saved {formatBytes(totalOriginal - totalCompressed)}
-                {outputFormat !== "original" && ` \u00b7 Converted to ${outputFormat.toUpperCase()}`}
-              </p>
-            </div>
-            <div className="rounded-2xl border border-gf-border-subtle overflow-hidden">
-              <ul>
-                {results.map((r, i) => (
-                  <li
-                    key={r.path}
-                    className={`ghost-in flex items-center justify-between px-5 py-3.5 ${
-                      i > 0 ? "border-t border-gf-border-subtle" : ""
-                    }`}
-                    style={{ animationDelay: `${0.1 + i * 0.08}s` }}
-                  >
-                    <span className="text-sm text-gf-text-secondary truncate mr-6">
-                      {r.name}
-                    </span>
-                    {r.success ? (
-                      <span className="flex items-center gap-4 shrink-0">
-                        <span className="font-mono text-xs text-gf-text-tertiary tabular-nums">
-                          {formatBytes(r.originalSize)} &rarr;{" "}
-                          {formatBytes(r.compressedSize)}
-                        </span>
-                        <span
-                          className={`font-mono text-sm font-semibold tabular-nums ${
-                            r.savingsPercent > 20
-                              ? "text-gf-success"
-                              : r.savingsPercent > 0
-                                ? "text-gf-text-secondary"
-                                : "text-gf-text-tertiary"
-                          }`}
-                        >
-                          {r.savingsPercent > 0
-                            ? `-${r.savingsPercent.toFixed(1)}%`
-                            : "0%"}
-                        </span>
-                      </span>
-                    ) : (
-                      <span className="text-xs text-gf-error shrink-0">
-                        {r.error ?? "Failed"}
-                      </span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-
-              <div className="flex items-center justify-between px-5 py-4 border-t border-gf-border">
-                <span className="text-sm font-medium text-gf-text-secondary">
-                  {results.length} {results.length === 1 ? "file" : "files"}
-                </span>
-                <span className="font-mono text-xs text-gf-text-tertiary tabular-nums">
-                  {formatBytes(totalOriginal)} &rarr; {formatBytes(totalCompressed)}
-                </span>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-3 mt-6 ghost-in ghost-delay-3">
-              <button
-                onClick={handleClear}
-                className={`px-5 py-2.5 text-sm font-medium rounded-xl bg-gf-accent text-gf-accent-text hover:bg-gf-accent-hover active:bg-gf-accent transition-all duration-200 ${focusRing}`}
-              >
-                Compress more
-              </button>
-            </div>
-          </div>
-        )}
-      </main>
+      {(appState === "compressing" || appState === "done") && (
+        <div
+          className={`absolute inset-0 z-[5] flex flex-col ${appState === "done" ? "compress-settle" : ""}`}
+          onAnimationEnd={() => {
+            if (appState === "done") {
+              setAppState("idle");
+              setCompressingFiles([]);
+            }
+          }}
+        >
+          {compressingFiles.map((file) => (
+            <ProgressBand
+              key={file.path}
+              file={file}
+              totalFiles={compressingFiles.length}
+              settling={appState === "done"}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
