@@ -1,1 +1,86 @@
 @import "tailwindcss";
+
+@theme {
+  --color-gf-bg: #1A1A1A;
+  --color-gf-surface: #1D1D1D;
+  --color-gf-surface-1: #202020;
+  --color-gf-surface-2: #242424;
+  --color-gf-surface-3: #272727;
+  --color-gf-text: #DACDBA;
+  --color-gf-text-secondary: #877F73;
+  --color-gf-text-tertiary: #6B6459;
+  --color-gf-text-disabled: #565048;
+  --color-gf-border-subtle: #2F2F2F;
+  --color-gf-border: #3C3C3C;
+  --color-gf-border-strong: #505050;
+  --color-gf-accent: #DC9882;
+  --color-gf-accent-hover: #E3AA96;
+  --color-gf-accent-text: #261E16;
+  --color-gf-success: #2F9C95;
+  --color-gf-error: #C16E70;
+  --font-display: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+}
+
+@keyframes fadeInUpGhost {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.ghost-in {
+  opacity: 0;
+  animation: fadeInUpGhost 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.ghost-delay-1 {
+  animation-delay: 0.12s;
+}
+
+.ghost-delay-3 {
+  animation-delay: 0.36s;
+}
+
+.dot-grid-base {
+  background-image: radial-gradient(circle, var(--color-gf-text-tertiary) 1px, transparent 1px);
+  background-size: 24px 24px;
+  mask-image: linear-gradient(to right, transparent 0%, black 100%);
+  -webkit-mask-image: linear-gradient(to right, transparent 0%, black 100%);
+  opacity: 0.5;
+  transition: opacity 0.5s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.dot-grid-active-layer {
+  background-image: radial-gradient(circle, var(--color-gf-success) 1px, transparent 1px);
+  background-size: 24px 24px;
+  mask-image: linear-gradient(to right, transparent 0%, black 100%);
+  -webkit-mask-image: linear-gradient(to right, transparent 0%, black 100%);
+  opacity: 0;
+  transition: opacity 0.5s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.dot-grid-active-layer.active {
+  opacity: 0.7;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ghost-in {
+    animation: none;
+    opacity: 1;
+  }
+  .dot-grid-base,
+  .dot-grid-active-layer {
+    transition: none;
+  }
+}
+
+body {
+  font-family: var(--font-display);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

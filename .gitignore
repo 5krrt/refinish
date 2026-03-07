@@ -30,3 +30,6 @@ Thumbs.db
 
 # Tauri generated
 src-tauri/gen/schemas
+
+# Claude Code
+CLAUDE.md
