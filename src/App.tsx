@@ -131,6 +131,7 @@ function ProgressBand({
     resize();
 
     function draw() {
+      if (!canvas) return;
       const now = performance.now();
       const { done, settling } = stateRef.current;
       const dpr = devicePixelRatio;
