@@ -4,8 +4,20 @@ use serde::Serialize;
 use std::fs;
 use std::panic::catch_unwind;
 use std::path::PathBuf;
+use tauri::Emitter;
 
-#[derive(Serialize)]
+// Progress payload sent to the frontend over Tauri events so each file's
+// progress bar can update independently as it finishes.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileProgress {
+    index: usize,
+    result: CompressionResult,
+}
+
+// Everything the UI needs to show per-file results. Sent both as an event
+// (during compression) and as the final return value (when all files are done).
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompressionResult {
     path: String,
@@ -17,21 +29,42 @@ struct CompressionResult {
     error: Option<String>,
 }
 
+// Main entry point from the frontend. Files are compressed in parallel via rayon
+// inside a blocking task so we don't choke Tauri's async runtime. Each file fires
+// a progress event as it finishes — the UI picks these up to update individual bars.
 #[tauri::command]
 async fn compress_images(
+    app: tauri::AppHandle,
     file_paths: Vec<String>,
     output_format: String,
 ) -> Result<Vec<CompressionResult>, String> {
     tokio::task::spawn_blocking(move || -> Vec<CompressionResult> {
-        file_paths
+        let mut indexed: Vec<(usize, CompressionResult)> = file_paths
             .par_iter()
-            .map(|p| compress_single(p, &output_format))
-            .collect()
+            .enumerate()
+            .map(|(i, p)| {
+                let result = compress_single(p, &output_format);
+                let _ = app.emit(
+                    "compression-progress",
+                    FileProgress {
+                        index: i,
+                        result: result.clone(),
+                    },
+                );
+                (i, result)
+            })
+            .collect();
+        // rayon doesn't guarantee order, so sort before returning
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, r)| r).collect()
     })
     .await
     .map_err(|e: tokio::task::JoinError| e.to_string())
 }
 
+// Pipeline for a single file: decode → re-encode to a temp file → compare sizes → swap.
+// If the result isn't smaller we bail, so we never make things worse. The original gets
+// moved to the system trash (not permanently deleted) so users can recover if needed.
 fn compress_single(path: &str, output_format: &str) -> CompressionResult {
     let original_path = PathBuf::from(path);
     let name = original_path
@@ -59,13 +92,13 @@ fn compress_single(path: &str, output_format: &str) -> CompressionResult {
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    // Determine effective output format
+    // "original" means keep the same format, just make it smaller
     let effective_format = match output_format {
         "original" => ext.as_str(),
         other => other,
     };
 
-    // Determine output extension (keep original for jpeg variants)
+    // Don't rename .jpeg to .jpg or vice versa — keep whatever the user had
     let output_ext = match effective_format {
         "jpg" | "jpeg" => ext.as_str(),
         other => other,
@@ -126,7 +159,7 @@ fn compress_single(path: &str, output_format: &str) -> CompressionResult {
         }
     };
 
-    // For same-format: skip if compressed >= original
+    // No point replacing a file with something the same size or bigger
     if !is_converting && compressed_size >= original_size {
         let _ = fs::remove_file(&tmp_path);
         return CompressionResult {
@@ -178,12 +211,17 @@ fn compress_single(path: &str, output_format: &str) -> CompressionResult {
     }
 }
 
+// Quality 80 for lossy formats — visually identical in most cases,
+// but typically shaves 40-70% off the file.
+
 fn compress_jpeg(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
     let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
     let rgb = img.to_rgb8();
     let (width, height) = rgb.dimensions();
     let pixels = rgb.as_raw();
 
+    // mozjpeg can panic on malformed input so we catch that rather
+    // than letting it take down the whole app
     let jpeg_bytes = catch_unwind(|| {
         let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
         comp.set_size(width as usize, height as usize);
@@ -202,6 +240,8 @@ fn compress_jpeg(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
 fn compress_png(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
     let in_file = oxipng::InFile::Path(input.clone());
     let out_file = oxipng::OutFile::from_path(output.clone());
+    // Preset 1 is a solid middle ground — much better than libpng defaults
+    // without burning 30 seconds on a large file like the higher presets do
     oxipng::optimize(&in_file, &out_file, &oxipng::Options::from_preset(1))
         .map(|_| ())
         .map_err(|e| format!("OxiPNG optimization failed: {}", e))
@@ -232,6 +272,7 @@ fn compress_avif(input: &PathBuf, output: &PathBuf) -> Result<(), String> {
         .map_err(|e| format!("AVIF encoding failed: {}", e))
 }
 
+// Boot up the Tauri app — registers plugins and exposes our commands to the frontend
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
