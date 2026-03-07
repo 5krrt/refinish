@@ -10,13 +10,19 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "Refinish",
         "width": 900,
         "height": 600,
         "minWidth": 600,
-        "minHeight": 400
+        "minHeight": 400,
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["underWindowBackground", "micaDark", "acrylic"],
+          "state": "active"
+        }
       }
     ],
     "security": {
