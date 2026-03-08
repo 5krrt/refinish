@@ -80,6 +80,7 @@ export default function DotGrid({
     settleComplete,
     dragBlend: 0,
     progressStarts: null as number[] | null,
+    doneTimestamps: null as number[] | null,
     settleStart: null as number | null,
     settleNotified: false,
     lastDpr: devicePixelRatio,
@@ -108,8 +109,10 @@ export default function DotGrid({
   useEffect(() => {
     if (appState === "compressing") {
       s.current.progressStarts = files.map((_, i) => performance.now() + i * 150);
+      s.current.doneTimestamps = new Array(files.length).fill(0);
     } else if (appState === "idle") {
       s.current.progressStarts = null;
+      s.current.doneTimestamps = null;
     }
   }, [appState]);
 
@@ -222,11 +225,16 @@ export default function DotGrid({
         const bandRowEnd = bandRowStart + bandRows;
 
         let progress = 0;
-        if (st.files[fi].done) {
-          progress = 1;
-        } else if (st.progressStarts) {
+        if (st.progressStarts) {
           const elapsed = Math.max(0, now - st.progressStarts[fi]);
           progress = Math.min(0.95, 1 - Math.exp((-3 * elapsed) / 5000));
+        }
+        if (st.files[fi].done && st.doneTimestamps) {
+          if (!st.doneTimestamps[fi]) st.doneTimestamps[fi] = now;
+          const doneElapsed = now - st.doneTimestamps[fi];
+          const t = Math.min(1, doneElapsed / 300);
+          const eased = t * t * (3 - 2 * t);
+          progress = progress + (1 - progress) * eased;
         }
 
         const filledCols = Math.round(progress * cols);
@@ -237,8 +245,9 @@ export default function DotGrid({
           const filled = col < filledCols;
           const settled = settleProgresses !== null && col < settledCols;
 
-          const stamp = filled && !settled ? stamps.verdigris : stamps.bgNeutral;
-          ctx.globalAlpha = filled && !settled ? (cols > 1 ? col / (cols - 1) : 1) : 1;
+          const grad = cols > 1 ? col / (cols - 1) : 1;
+          const stamp = filled && !settled ? stamps.verdigris : stamps.blend[0];
+          ctx.globalAlpha = filled && !settled ? grad : grad * 0.5;
 
           for (let row = bandRowStart; row < bandRowEnd; row++) {
             ctx.drawImage(stamp, x, oy + row * CELL, DOT, DOT);
