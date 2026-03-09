@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { Window } from "@tauri-apps/api/window";
 import DotGrid from "./DotGrid";
+import { usePersistedState } from "./usePersistedState";
 
 const validExts = ["jpg", "jpeg", "png", "webp", "avif"];
 
@@ -35,21 +37,12 @@ interface FileProgress {
   };
 }
 
-function usePersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
-  const [value, setValue] = useState<T>(() => {
-    try {
-      const stored = localStorage.getItem(key);
-      return stored !== null ? JSON.parse(stored) : defaultValue;
-    } catch {
-      return defaultValue;
-    }
-  });
-
-  useEffect(() => {
-    localStorage.setItem(key, JSON.stringify(value));
-  }, [key, value]);
-
-  return [value, setValue];
+async function openSettings() {
+  const win = await Window.getByLabel("settings");
+  if (win) {
+    await win.show();
+    await win.setFocus();
+  }
 }
 
 function App() {
@@ -57,67 +50,11 @@ function App() {
   const [compressingFiles, setCompressingFiles] = useState<CompressingFile[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
   const compressingRef = useRef(false);
-  const [quality, setQuality] = usePersistedState("refinish:quality", 80);
-  const [mode, setMode] = usePersistedState<"compress" | "convert">("refinish:mode", "compress");
-  const [convertFormat, setConvertFormat] = usePersistedState("refinish:convertFormat", "webp");
-  const [showFormats, setShowFormats] = useState(mode === "convert");
-  const [formatsExiting, setFormatsExiting] = useState(false);
+  const [quality] = usePersistedState("refinish:quality", 80);
+  const [mode] = usePersistedState<"compress" | "convert">("refinish:mode", "compress");
+  const [convertFormat] = usePersistedState("refinish:convertFormat", "webp");
+  const [scaleFactor] = usePersistedState("refinish:scaleFactor", 0);
   const [settleComplete, setSettleComplete] = useState(false);
-
-  // Slider ref — DotGrid reads bounds live from this element each frame
-  const sliderRef = useRef<HTMLDivElement>(null);
-  const [sliderEl, setSliderEl] = useState<HTMLDivElement | null>(null);
-  const draggingRef = useRef(false);
-
-  useEffect(() => {
-    setSliderEl(sliderRef.current);
-  }, []);
-
-  // Slider mouse interaction
-  const valueFromX = useCallback(
-    (clientX: number) => {
-      const el = sliderRef.current;
-      if (!el) return quality;
-      const rect = el.getBoundingClientRect();
-      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-      return Math.round(50 + ratio * 50);
-    },
-    [quality]
-  );
-
-  const handleSliderMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault();
-      draggingRef.current = true;
-      setQuality(valueFromX(e.clientX));
-
-      const onMove = (ev: MouseEvent) => {
-        if (draggingRef.current) setQuality(valueFromX(ev.clientX));
-      };
-      const onUp = () => {
-        draggingRef.current = false;
-        window.removeEventListener("mousemove", onMove);
-        window.removeEventListener("mouseup", onUp);
-      };
-      window.addEventListener("mousemove", onMove);
-      window.addEventListener("mouseup", onUp);
-    },
-    [setQuality, valueFromX]
-  );
-
-  useEffect(() => {
-    if (mode === "convert") {
-      setFormatsExiting(false);
-      setShowFormats(true);
-    } else if (showFormats) {
-      setFormatsExiting(true);
-      const timer = setTimeout(() => {
-        setShowFormats(false);
-        setFormatsExiting(false);
-      }, 250 + 3 * 60);
-      return () => clearTimeout(timer);
-    }
-  }, [mode]);
 
   const handleDrop = useCallback((paths: string[]) => {
     if (compressingRef.current) return;
@@ -143,10 +80,11 @@ function App() {
       filePaths: filtered,
       outputFormat: mode === "convert" ? convertFormat : "original",
       quality,
+      scaleFactor,
     }).finally(() => {
       compressingRef.current = false;
     });
-  }, [mode, convertFormat, quality]);
+  }, [mode, convertFormat, quality, scaleFactor]);
 
   useEffect(() => {
     const unlisten: (() => void)[] = [];
@@ -210,7 +148,7 @@ function App() {
         appState={appState}
         isDragOver={isDragOver}
         files={compressingFiles}
-        sliderEl={sliderEl}
+        sliderEl={null}
         quality={quality}
         settleComplete={settleComplete}
         onSettleComplete={handleSettleComplete}
@@ -265,56 +203,24 @@ function App() {
 
       {(appState === "idle" || appState === "done") && (
         <div
-          className={`absolute bottom-0 left-0 right-0 z-10 px-16 pb-10 ghost-in ghost-delay-3 transition-opacity duration-500 ${isDragOver ? "opacity-0" : ""}`}
+          className={`absolute bottom-0 left-0 right-0 z-10 ghost-in ghost-delay-3 transition-opacity duration-500 ${isDragOver ? "opacity-0" : ""}`}
         >
-          <div className="flex items-center gap-3 mb-4">
+          <div className="flex items-center justify-between px-5 py-3 bg-gf-surface/60 backdrop-blur-md border-t border-gf-border-subtle">
+            <span className="font-condensed text-xs tracking-wide text-gf-text-secondary">
+              {mode === "convert"
+                ? `Convert to ${convertFormat.toUpperCase()} \u00b7 Quality ${quality}`
+                : `Compress \u00b7 Quality ${quality}`}
+              {scaleFactor > 1 && ` \u00b7 ${scaleFactor}\u00d7 upscale`}
+            </span>
             <button
-              className={`font-condensed text-xs tracking-wide transition-colors duration-300 ${mode === "compress" ? "text-gf-verdigris" : "text-gf-text-secondary"}`}
-              onClick={() => setMode("compress")}
+              onClick={openSettings}
+              className="text-gf-text-secondary hover:text-gf-text transition-colors duration-200 p-1 -m-1"
+              aria-label="Open settings"
             >
-              COMPRESS
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
+                <path fillRule="evenodd" d="M8.34 1.804A1 1 0 0 1 9.32 1h1.36a1 1 0 0 1 .98.804l.295 1.473c.497.144.971.342 1.416.587l1.25-.834a1 1 0 0 1 1.262.125l.962.962a1 1 0 0 1 .125 1.262l-.834 1.25c.245.445.443.919.587 1.416l1.473.294a1 1 0 0 1 .804.98v1.362a1 1 0 0 1-.804.98l-1.473.295a6.95 6.95 0 0 1-.587 1.416l.834 1.25a1 1 0 0 1-.125 1.262l-.962.962a1 1 0 0 1-1.262.125l-1.25-.834a6.953 6.953 0 0 1-1.416.587l-.294 1.473a1 1 0 0 1-.98.804H9.32a1 1 0 0 1-.98-.804l-.295-1.473a6.957 6.957 0 0 1-1.416-.587l-1.25.834a1 1 0 0 1-1.262-.125l-.962-.962a1 1 0 0 1-.125-1.262l.834-1.25a6.957 6.957 0 0 1-.587-1.416l-1.473-.294A1 1 0 0 1 1 11.68V10.32a1 1 0 0 1 .804-.98l1.473-.295c.144-.497.342-.971.587-1.416l-.834-1.25a1 1 0 0 1 .125-1.262l.962-.962A1 1 0 0 1 5.38 4.03l1.25.834a6.957 6.957 0 0 1 1.416-.587l.294-1.473ZM13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" clipRule="evenodd" />
+              </svg>
             </button>
-            <button
-              className={`font-condensed text-xs tracking-wide transition-colors duration-300 ${mode === "convert" ? "text-gf-verdigris" : "text-gf-text-secondary"}`}
-              onClick={() => setMode("convert")}
-            >
-              CONVERT
-            </button>
-            {showFormats && (
-              <div className="flex items-center gap-2 ml-2">
-                {(["jpg", "png", "webp", "avif"] as const).map((fmt, i) => (
-                  <button
-                    key={fmt}
-                    className={`font-condensed text-xs tracking-wide transition-colors duration-300 ${convertFormat === fmt ? "text-gf-verdigris" : "text-gf-text-secondary"}`}
-                    style={{
-                      animation: formatsExiting
-                        ? `fadeOut 250ms ${(3 - i) * 60}ms cubic-bezier(0.16, 1, 0.3, 1) forwards`
-                        : `fadeIn 250ms ${i * 60}ms cubic-bezier(0.16, 1, 0.3, 1) forwards`,
-                      opacity: formatsExiting ? 1 : 0,
-                    }}
-                    onClick={() => setConvertFormat(fmt)}
-                  >
-                    {fmt.toUpperCase()}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-          <div className="flex items-center gap-4">
-            <div className="flex-1">
-              <div
-                ref={sliderRef}
-                className="cursor-pointer select-none"
-                style={{ height: 32 }}
-                onMouseDown={handleSliderMouseDown}
-              />
-            </div>
-            <div className="flex flex-col items-end">
-              <span className="font-condensed text-xs text-gf-text-secondary">QUALITY</span>
-              <span className="font-condensed text-xs text-gf-text-secondary tabular-nums">
-                {quality}
-              </span>
-            </div>
           </div>
         </div>
       )}

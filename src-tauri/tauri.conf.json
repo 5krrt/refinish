@@ -23,6 +23,21 @@
           "effects": ["underWindowBackground", "micaDark", "acrylic"],
           "state": "active"
         }
+      },
+      {
+        "label": "settings",
+        "title": "Settings",
+        "url": "index.html#settings",
+        "width": 480,
+        "height": 380,
+        "resizable": false,
+        "visible": false,
+        "transparent": true,
+        "decorations": true,
+        "windowEffects": {
+          "effects": ["underWindowBackground", "micaDark", "acrylic"],
+          "state": "active"
+        }
       }
     ],
     "security": {

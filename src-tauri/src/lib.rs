@@ -1,4 +1,4 @@
-use image::ImageEncoder;
+use image::{DynamicImage, GenericImageView, ImageEncoder};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::fs;
@@ -41,13 +41,14 @@ async fn compress_images(
     file_paths: Vec<String>,
     output_format: String,
     quality: u8,
+    scale_factor: u32,
 ) -> Result<Vec<CompressionResult>, String> {
     tokio::task::spawn_blocking(move || -> Vec<CompressionResult> {
         let mut indexed: Vec<(usize, CompressionResult)> = file_paths
             .par_iter()
             .enumerate()
             .map(|(i, p)| {
-                let result = compress_single(p, &output_format, quality);
+                let result = compress_single(p, &output_format, quality, scale_factor);
                 let _ = app.emit(
                     "compression-progress",
                     FileProgress {
@@ -66,10 +67,20 @@ async fn compress_images(
     .map_err(|e: tokio::task::JoinError| e.to_string())
 }
 
-// Pipeline for a single file: decode → re-encode to a temp file → compare sizes → swap.
+fn resize_if_needed(img: DynamicImage, scale_factor: u32) -> DynamicImage {
+    if scale_factor <= 1 {
+        return img;
+    }
+    let (w, h) = img.dimensions();
+    let new_w = w * scale_factor;
+    let new_h = h * scale_factor;
+    img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3)
+}
+
+// Pipeline for a single file: decode → resize → re-encode to a temp file → compare sizes → swap.
 // If the result isn't smaller we bail, so we never make things worse. The original gets
 // moved to the system trash (not permanently deleted) so users can recover if needed.
-fn compress_single(path: &str, output_format: &str, quality: u8) -> CompressionResult {
+fn compress_single(path: &str, output_format: &str, quality: u8, scale_factor: u32) -> CompressionResult {
     let original_path = PathBuf::from(path);
     let name = original_path
         .file_name()
@@ -126,11 +137,31 @@ fn compress_single(path: &str, output_format: &str, quality: u8) -> CompressionR
         .unwrap_or(&original_path)
         .join(format!(".{}.tmp", name));
 
+    // Decode image once, resize if needed, then pass to format-specific encoders
+    let img = match image::open(&original_path) {
+        Ok(img) => img,
+        Err(e) => {
+            return CompressionResult {
+                path: path.to_string(),
+                name,
+                original_size,
+                compressed_size: 0,
+                savings_percent: 0.0,
+                success: false,
+                error: Some(format!("Cannot decode image: {}", e)),
+            };
+        }
+    };
+
+    let (orig_w, orig_h) = img.dimensions();
+    let img = resize_if_needed(img, scale_factor);
+    let was_resized = (orig_w, orig_h) != img.dimensions();
+
     let compress_result = match effective_format {
-        "jpg" | "jpeg" => compress_jpeg(&original_path, &tmp_path, quality),
-        "png" => compress_png(&original_path, &tmp_path, quality),
-        "webp" => compress_webp(&original_path, &tmp_path, quality),
-        "avif" => compress_avif(&original_path, &tmp_path, quality),
+        "jpg" | "jpeg" => compress_jpeg(&img, &tmp_path, quality),
+        "png" => compress_png(&img, &tmp_path, quality),
+        "webp" => compress_webp(&img, &tmp_path, quality),
+        "avif" => compress_avif(&img, &tmp_path, quality),
         _ => Err(format!("Unsupported format: .{}", ext)),
     };
 
@@ -163,8 +194,9 @@ fn compress_single(path: &str, output_format: &str, quality: u8) -> CompressionR
         }
     };
 
-    // No point replacing a file with something the same size or bigger
-    if !is_converting && compressed_size >= original_size {
+    // No point replacing a file with something the same size or bigger,
+    // but skip this guard when the user explicitly requested a resize
+    if !is_converting && !was_resized && compressed_size >= original_size {
         let _ = fs::remove_file(&tmp_path);
         return CompressionResult {
             path: path.to_string(),
@@ -225,9 +257,8 @@ fn compress_single(path: &str, output_format: &str, quality: u8) -> CompressionR
 // Quality is user-configurable (50-100). For lossy formats it maps directly
 // to encoder quality; for PNG it controls the oxipng optimization preset.
 
-fn compress_jpeg(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
-    let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
-    let rgb = img.into_rgb8();
+fn compress_jpeg(img: &DynamicImage, output: &PathBuf, quality: u8) -> Result<(), String> {
+    let rgb = img.to_rgb8();
     let (width, height) = rgb.dimensions();
     let pixels = rgb.as_raw();
 
@@ -248,29 +279,35 @@ fn compress_jpeg(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), S
     fs::write(output, jpeg_bytes).map_err(|e| format!("Cannot write compressed file: {}", e))
 }
 
-fn compress_png(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
-    let in_file = oxipng::InFile::Path(input.clone());
+fn compress_png(img: &DynamicImage, output: &PathBuf, quality: u8) -> Result<(), String> {
+    // oxipng needs a file path, so save the (possibly resized) image to a tmp file first
+    let tmp_png = output.with_extension("tmp.png");
+    img.save(&tmp_png)
+        .map_err(|e| format!("Cannot write temp PNG: {}", e))?;
+
+    let in_file = oxipng::InFile::Path(tmp_png.clone());
     let out_file = oxipng::OutFile::from_path(output.clone());
     // Map quality to oxipng preset: higher quality = less aggressive (preset 1),
     // lower quality = more aggressive compression (preset 4)
     let preset = if quality >= 90 { 1 } else if quality >= 70 { 2 } else if quality >= 50 { 3 } else { 4 };
-    oxipng::optimize(&in_file, &out_file, &oxipng::Options::from_preset(preset))
+    let result = oxipng::optimize(&in_file, &out_file, &oxipng::Options::from_preset(preset))
         .map(|_| ())
-        .map_err(|e| format!("OxiPNG optimization failed: {}", e))
+        .map_err(|e| format!("OxiPNG optimization failed: {}", e));
+
+    let _ = fs::remove_file(&tmp_png);
+    result
 }
 
-fn compress_webp(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
-    let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
-    let rgba = img.into_rgba8();
+fn compress_webp(img: &DynamicImage, output: &PathBuf, quality: u8) -> Result<(), String> {
+    let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
     let encoder = webp::Encoder::from_rgba(rgba.as_raw(), width, height);
     let memory = encoder.encode(quality as f32);
     fs::write(output, &*memory).map_err(|e| format!("Cannot write compressed file: {}", e))
 }
 
-fn compress_avif(input: &PathBuf, output: &PathBuf, quality: u8) -> Result<(), String> {
-    let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
-    let rgba = img.into_rgba8();
+fn compress_avif(img: &DynamicImage, output: &PathBuf, quality: u8) -> Result<(), String> {
+    let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
     let file =
         fs::File::create(output).map_err(|e| format!("Cannot create output file: {}", e))?;
