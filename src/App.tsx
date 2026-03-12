@@ -22,6 +22,7 @@ interface CompressingFile {
   path: string;
   name: string;
   done: boolean;
+  warning?: string | null;
 }
 
 interface FileProgress {
@@ -34,6 +35,7 @@ interface FileProgress {
     savingsPercent: number;
     success: boolean;
     error: string | null;
+    warning: string | null;
   };
 }
 
@@ -107,9 +109,9 @@ function App() {
     let cancel: (() => void) | null = null;
 
     listen<FileProgress>("compression-progress", (event) => {
-      const { index } = event.payload;
+      const { index, result } = event.payload;
       setCompressingFiles((prev) =>
-        prev.map((f, i) => (i === index ? { ...f, done: true } : f))
+        prev.map((f, i) => (i === index ? { ...f, done: true, warning: result.warning } : f))
       );
     }).then((u) => {
       cancel = u;
@@ -210,7 +212,7 @@ function App() {
               {mode === "convert"
                 ? `Convert to ${convertFormat.toUpperCase()} \u00b7 Quality ${quality}`
                 : `Compress \u00b7 Quality ${quality}`}
-              {scaleFactor > 1 && ` \u00b7 ${scaleFactor}\u00d7 upscale`}
+              {scaleFactor === 1 ? " \u00b7 Original upscale" : scaleFactor > 1 ? ` \u00b7 ${scaleFactor}\u00d7 upscale` : ""}
             </span>
             <button
               onClick={openSettings}
@@ -254,6 +256,11 @@ function App() {
                 }}
               >
                 {file.name}
+                {file.warning && (
+                  <div className="text-[10px] font-condensed text-gf-text-secondary/70 mt-0.5">
+                    {file.warning}
+                  </div>
+                )}
               </div>
             </div>
           ))}

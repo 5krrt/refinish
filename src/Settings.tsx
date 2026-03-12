@@ -122,6 +122,26 @@ function Settings() {
               </button>
             );
           })}
+          <button
+            className="group relative flex flex-col items-center gap-2 cursor-pointer"
+            onClick={() => setScaleFactor(1)}
+          >
+            <div
+              className={`rounded-sm transition-all duration-300 flex items-center justify-center ${scaleFactor === 1 ? "border-gf-verdigris bg-gf-verdigris/20" : "border-gf-border-subtle group-hover:border-gf-text-secondary"} border`}
+              style={{ width: 26, height: 26 }}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className={`w-3.5 h-3.5 transition-colors duration-300 ${scaleFactor === 1 ? "text-gf-verdigris" : "text-gf-text-secondary"}`}>
+                <path d="M3 4a1 1 0 0 1 1-1h1.586a1 1 0 0 1 .707.293l.707.707H12a1 1 0 0 1 1 1v1H3V4Z" />
+                <path fillRule="evenodd" d="M3 7h10a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1Zm3 3.5a1.5 1.5 0 1 0 3 0V10a.5.5 0 0 0-.5-.5h-2a.5.5 0 0 0-.5.5v.5Z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <span className={`font-condensed text-[10px] tracking-wide transition-colors duration-300 ${scaleFactor === 1 ? "text-gf-verdigris" : "text-gf-text-secondary"}`}>
+              ORIGINAL
+            </span>
+            <div className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-48 rounded bg-gf-surface/90 backdrop-blur px-3 py-2 text-xs text-gf-text-secondary opacity-0 group-hover:opacity-100 transition-opacity duration-200 text-center">
+              Resize to camera&apos;s native resolution using EXIF metadata. Works with photos from recognized cameras.
+            </div>
+          </button>
           <span className="font-condensed text-xs tracking-wide text-gf-text-secondary ml-auto">SCALE</span>
         </div>
         <div className="flex items-center gap-3 mb-4">
