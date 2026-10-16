@@ -459,6 +459,18 @@ fn compress_single(path: &str, output_format: &str, quality: u8, scale_factor: u
     }
 }
 
+// Headless entry for scripts (used by refinish-cli). Unlike compress_single this never
+// touches the input: no resize, no in-place swap, no trashing — it just writes a
+// mozjpeg-encoded copy to `output` and returns its size. Metadata isn't carried over,
+// so callers that need EXIF/ICC should copy those segments back themselves.
+pub fn compress_jpeg_to(input: &std::path::Path, output: &std::path::Path, quality: u8) -> Result<u64, String> {
+    let img = image::open(input).map_err(|e| format!("Cannot decode image: {}", e))?;
+    compress_jpeg(&img, &output.to_path_buf(), quality.clamp(1, 100))?;
+    fs::metadata(output)
+        .map(|m| m.len())
+        .map_err(|e| format!("Cannot read compressed file: {}", e))
+}
+
 // Quality is user-configurable (50-100). For lossy formats it maps directly
 // to encoder quality; for PNG it controls the oxipng optimization preset.
 

@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Lightweight image compression and conversion"
 authors = ["Arnav Lande"]
 edition = "2021"
+# Two binaries live in this package (the app + refinish-cli), so tell cargo/tauri which one `run` means
+default-run = "refinish"
 
 [lib]
 name = "refinish_lib"
